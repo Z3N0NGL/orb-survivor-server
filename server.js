@@ -218,14 +218,17 @@ wss.on('connection', (ws) => {
       ws.roomId = msg.roomId || 'main';
       ws.playerId = msg.playerId || ('guest_' + Math.random().toString(36).slice(2, 8));
       ws.displayName = msg.displayName || 'Player';
-      ws.isOwner = !!msg.isOwner;
+      // Never trust a client-supplied isOwner flag - a malicious client could just
+      // send isOwner:true. Owner status is only ever true if this exact player ID
+      // (their Discord ID) is in the server's own OWNER_DISCORD_IDS list.
+      ws.isOwner = ownerIds.has(ws.playerId);
 
       const room = getRoom(ws.roomId);
       room.players.set(ws, {
         id: ws.playerId, name: ws.displayName, x: 0, y: 0, hp: 100, alive: true
       });
 
-      ws.send(JSON.stringify({ type: 'joined', playerId: ws.playerId }));
+      ws.send(JSON.stringify({ type: 'joined', playerId: ws.playerId, isOwner: ws.isOwner }));
       return;
     }
 
@@ -280,7 +283,7 @@ setInterval(() => {
 // Broadcast loop: send each room's player snapshot to everyone in it
 setInterval(() => {
   for (const [roomId, room] of rooms) {
-    if (room.players.size === 0) continue;
+    if (room.players.size < 2) continue; // nobody to sync with yet, skip the work
     const snapshot = Array.from(room.players.values());
     const packet = JSON.stringify({ type: 'snapshot', players: snapshot });
     for (const client of room.players.keys()) {
