@@ -1,0 +1,19 @@
+{
+  "name": "orb-survivor-server",
+  "version": "1.0.0",
+  "description": "Discord login bridge + PlayFab bridge + realtime multiplayer relay for Orb Survivor",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "ws": "^8.17.0",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
