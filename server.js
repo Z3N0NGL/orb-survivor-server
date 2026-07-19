@@ -149,19 +149,32 @@ app.get('/auth/discord/callback', async (req, res) => {
       isOwner: ownerIds.has(discordId) ? 'true' : 'false'
     });
 
-    // 5. Hand the result back to the game. We redirect to the game page with
-    //    the session info in the URL fragment (#...) so it never hits server logs.
-    //    Change GAME_URL to your actual itch.io page.
-    const GAME_URL = ALLOWED_ORIGIN !== '*' ? ALLOWED_ORIGIN : 'https://realz3n0.itch.io/orb';
-    const payload = encodeURIComponent(JSON.stringify({
+    // 5. This response runs inside the popup window the game opened.
+    //    Post the result back to whichever window opened us, then close.
+    //    We can't reliably know the exact origin of an itch.io game (it's
+    //    served from a per-project subdomain), so we post with '*' — the
+    //    payload itself only contains a PlayFab session ticket, not the
+    //    PlayFab secret key or Discord client secret, so this is safe to
+    //    hand to whichever page opened the popup.
+    const payload = JSON.stringify({
       playFabId,
       sessionTicket,
       discordId,
       discordUsername,
       avatarUrl,
       isOwner: ownerIds.has(discordId)
-    }));
-    res.redirect(`${GAME_URL}#auth=${payload}`);
+    });
+    res.send(`<!DOCTYPE html><html><body style="background:#05060a;color:#e9edf7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+      <p>Login complete — you can close this window.</p>
+      <script>
+        try {
+          if (window.opener) {
+            window.opener.postMessage({ type: 'orbsurvivor_auth', payload: ${payload} }, '*');
+          }
+        } catch (e) {}
+        setTimeout(() => window.close(), 800);
+      </script>
+    </body></html>`);
   } catch (err) {
     console.error(err);
     res.status(500).send('Login failed: ' + err.message);
