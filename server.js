@@ -2,7 +2,23 @@
    ORB SURVIVOR BACKEND
    - Discord OAuth2 code exchange (keeps client secret private)
    - PlayFab bridge (login player by Discord ID, set display name = Discord username)
-   - WebSocket relay for realtime multiplayer (authoritative-ish position relay)
+   - WebSocket relay for realtime multiplayer / Team Up co-op (BETA)
+
+   TEAM UP ARCHITECTURE (host-authoritative, low-lag):
+   - The first player in a room is the "host". The host's browser runs the
+     real simulation (waves, enemy AI, spawns). Everyone else is a
+     "follower" - they send inputs and locally-predicted shots, but the
+     host's enemy/wave state is the source of truth.
+   - This means the server itself does almost no simulation work - it's a
+     thin, fast relay - which is what keeps this smooth even on a small
+     free-tier instance. Server responsibilities are limited to:
+       1. Room membership + ready/start handshake (the lobby flow)
+       2. Rebroadcasting player inputs at a fast, fixed tick rate
+       3. Rebroadcasting the host's authoritative snapshot (enemies, wave,
+          bullets-hit-events) to followers
+       4. Rebroadcasting followers' locally-fired shots so everyone sees
+          everyone's bullets
+       5. Relaying respawn requests/grants and reassigning host on drop
 
    ALL SECRETS COME FROM ENVIRONMENT VARIABLES. Never hardcode them here.
    Set these in Render's dashboard under your service -> Environment:
@@ -42,7 +58,7 @@ app.use(express.json());
    HEALTH CHECK (Render pings this / you can check it's alive in a browser)
 ===================================================================== */
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'orb-survivor-server', time: Date.now() });
+  res.json({ ok: true, service: 'orb-survivor-server', time: Date.now(), rooms: rooms ? rooms.size : 0 });
 });
 
 /* =====================================================================
@@ -68,9 +84,6 @@ async function pfCall(path, body, useSecretKey = true) {
   return json.data;
 }
 
-// Logs a Discord user into PlayFab, creating the account on first login.
-// Uses the Discord ID as the PlayFab "ServerCustomId" so it's a stable,
-// permanent link between the two systems.
 async function loginToPlayFabWithDiscordId(discordId) {
   return pfCall('/Server/LoginWithServerCustomId', {
     ServerCustomId: discordId,
@@ -98,16 +111,12 @@ async function getPlayFabUserData(playFabId) {
 
 /* =====================================================================
    DISCORD OAUTH2 CALLBACK
-   Your game redirects the browser to Discord's authorize URL, Discord
-   redirects back here with ?code=..., and this exchanges that code for
-   the user's identity, then bridges them into PlayFab.
 ===================================================================== */
 app.get('/auth/discord/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing code');
 
   try {
-    // 1. Exchange the code for a Discord access token (secret stays server-side)
     const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -122,7 +131,6 @@ app.get('/auth/discord/callback', async (req, res) => {
     const tokenJson = await tokenRes.json();
     if (!tokenRes.ok) throw new Error(tokenJson.error_description || 'Discord token exchange failed');
 
-    // 2. Fetch the Discord profile
     const profileRes = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${tokenJson.access_token}` }
     });
@@ -135,12 +143,10 @@ app.get('/auth/discord/callback', async (req, res) => {
       ? `https://cdn.discordapp.com/avatars/${discordId}/${profile.avatar}.png`
       : null;
 
-    // 3. Log into (or create) the matching PlayFab account
     const pfLogin = await loginToPlayFabWithDiscordId(discordId);
     const playFabId = pfLogin.PlayFabId;
-    const sessionTicket = pfLogin.SessionTicket; // used by the game client for direct Client API calls
+    const sessionTicket = pfLogin.SessionTicket;
 
-    // 4. Make their PlayFab display name their Discord name, and store profile info
     await setPlayFabDisplayName(playFabId, discordUsername).catch(e => console.warn('display name set failed', e.message));
     await setPlayFabUserData(playFabId, {
       discordId,
@@ -149,13 +155,6 @@ app.get('/auth/discord/callback', async (req, res) => {
       isOwner: ownerIds.has(discordId) ? 'true' : 'false'
     });
 
-    // 5. This response runs inside the popup window the game opened.
-    //    Post the result back to whichever window opened us, then close.
-    //    We can't reliably know the exact origin of an itch.io game (it's
-    //    served from a per-project subdomain), so we post with '*' — the
-    //    payload itself only contains a PlayFab session ticket, not the
-    //    PlayFab secret key or Discord client secret, so this is safe to
-    //    hand to whichever page opened the popup.
     const payload = JSON.stringify({
       playFabId,
       sessionTicket,
@@ -182,25 +181,67 @@ app.get('/auth/discord/callback', async (req, res) => {
 });
 
 /* =====================================================================
-   WEBSOCKET RELAY (the "no lag" multiplayer part)
-   - Rooms of players
-   - Clients send inputs/positions, server rebroadcasts to everyone else
-     in the room at a fixed tick rate
-   - Basic sanity limits so one player can't spam garbage data
+   WEBSOCKET RELAY - TEAM UP (BETA)
 ===================================================================== */
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, perMessageDeflate: false }); // compression adds latency for tiny frequent packets - skip it
 
-const rooms = new Map(); // roomId -> { players: Map(ws -> playerState) }
-const TICK_MS = 50; // 20 ticks/sec broadcast rate
+const rooms = new Map(); // roomId -> Room
+const INPUT_TICK_MS = 33;   // ~30Hz position/aim relay (was 20Hz) - noticeably smoother
+const HOST_SYNC_TICK_MS = 50; // ~20Hz host authoritative snapshot relay (enemies/wave)
+const MAX_ROOM_SIZE = 8;
 
+function makeRoom(roomId) {
+  return {
+    id: roomId,
+    players: new Map(),   // ws -> playerState
+    hostWs: null,
+    started: false,
+    wave: 1,
+  };
+}
 function getRoom(roomId) {
   let room = rooms.get(roomId);
-  if (!room) {
-    room = { players: new Map() };
-    rooms.set(roomId, room);
-  }
+  if (!room) { room = makeRoom(roomId); rooms.set(roomId, room); }
   return room;
+}
+
+function safeSend(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+function broadcastRoom(room, obj, exceptWs) {
+  const packet = JSON.stringify(obj);
+  for (const client of room.players.keys()) {
+    if (client !== exceptWs && client.readyState === WebSocket.OPEN) client.send(packet);
+  }
+}
+
+function lobbySnapshot(room) {
+  return {
+    type: 'lobbyState',
+    hostId: room.hostWs ? room.players.get(room.hostWs)?.id : null,
+    started: room.started,
+    players: Array.from(room.players.values()).map(p => ({
+      id: p.id, name: p.name, ready: !!p.ready, isHost: room.hostWs && room.players.get(room.hostWs)?.id === p.id
+    }))
+  };
+}
+function broadcastLobby(room) {
+  broadcastRoom(room, lobbySnapshot(room));
+}
+
+// Reassign host to the longest-connected remaining player (Map preserves insertion order).
+function reassignHostIfNeeded(room) {
+  if (room.hostWs && room.players.has(room.hostWs)) return; // still valid
+  const next = room.players.keys().next();
+  room.hostWs = next.done ? null : next.value;
+  if (room.hostWs) {
+    // New host never inherits the old host's mid-run sim state - safest is to
+    // drop back to the lobby so nobody's stuck watching a frozen game.
+    room.started = false;
+    for (const p of room.players.values()) p.ready = false;
+    broadcastRoom(room, { type: 'hostChanged', hostId: room.players.get(room.hostWs).id });
+  }
 }
 
 wss.on('connection', (ws) => {
@@ -214,45 +255,122 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
+    /* ---------------- JOIN ---------------- */
     if (msg.type === 'join') {
       ws.roomId = msg.roomId || 'main';
       ws.playerId = msg.playerId || ('guest_' + Math.random().toString(36).slice(2, 8));
       ws.displayName = msg.displayName || 'Player';
-      // Never trust a client-supplied isOwner flag - a malicious client could just
-      // send isOwner:true. Owner status is only ever true if this exact player ID
-      // (their Discord ID) is in the server's own OWNER_DISCORD_IDS list.
-      ws.isOwner = ownerIds.has(ws.playerId);
+      ws.isOwner = ownerIds.has(ws.playerId); // never trust client-claimed isOwner
 
       const room = getRoom(ws.roomId);
-      room.players.set(ws, {
-        id: ws.playerId, name: ws.displayName, x: 0, y: 0, hp: 100, alive: true
-      });
+      if (room.players.size >= MAX_ROOM_SIZE) {
+        safeSend(ws, { type: 'joinRejected', reason: 'Lobby is full.' });
+        ws.close();
+        return;
+      }
 
-      ws.send(JSON.stringify({ type: 'joined', playerId: ws.playerId, isOwner: ws.isOwner }));
+      room.players.set(ws, {
+        id: ws.playerId, name: ws.displayName, x: 0, y: 0, hp: 100, alive: true,
+        ready: false
+      });
+      if (!room.hostWs) room.hostWs = ws; // first player in an empty room becomes host
+
+      ws.send(JSON.stringify({
+        type: 'joined',
+        playerId: ws.playerId,
+        isOwner: ws.isOwner,
+        isHost: room.hostWs === ws,
+        started: room.started
+      }));
+      broadcastLobby(room);
       return;
     }
 
-    if (msg.type === 'input' && ws.roomId) {
-      const room = rooms.get(ws.roomId);
-      if (!room) return;
+    if (!ws.roomId) return; // everything below requires having joined a room
+    const room = rooms.get(ws.roomId);
+    if (!room) return;
+
+    /* ---------------- READY / START (lobby handshake) ---------------- */
+    if (msg.type === 'ready') {
+      const p = room.players.get(ws);
+      if (p) { p.ready = !!msg.value; broadcastLobby(room); }
+      return;
+    }
+
+    if (msg.type === 'startGame') {
+      if (ws !== room.hostWs) return; // only the host can start
+      room.started = true;
+      room.wave = 1;
+      broadcastRoom(room, { type: 'gameStart', seed: Date.now() });
+      return;
+    }
+
+    if (msg.type === 'leaveGame') {
+      // Host or player voluntarily returns everyone to the lobby (e.g. host ended the run)
+      if (ws === room.hostWs) {
+        room.started = false;
+        for (const p of room.players.values()) p.ready = false;
+        broadcastRoom(room, { type: 'gameEnded' });
+        broadcastLobby(room);
+      }
+      return;
+    }
+
+    /* ---------------- FAST POSITION/INPUT RELAY ---------------- */
+    if (msg.type === 'input') {
       const p = room.players.get(ws);
       if (!p) return;
-      // Basic sanity clamp - never fully trust the client's own claimed position.
       if (typeof msg.x === 'number' && typeof msg.y === 'number') {
         p.x = Math.max(0, Math.min(6400, msg.x));
         p.y = Math.max(0, Math.min(6400, msg.y));
       }
-      if (typeof msg.hp === 'number') p.hp = msg.hp;
+      if (typeof msg.hp === 'number') p.hp = Math.max(0, Math.min(999999, msg.hp));
       if (typeof msg.aimAngle === 'number') p.aimAngle = msg.aimAngle;
+      if (typeof msg.alive === 'boolean') p.alive = msg.alive;
+      if (typeof msg.weaponId === 'string') p.weaponId = msg.weaponId;
       return;
     }
 
+    /* ---------------- SHARED SHOOTING: followers' own shots ---------------- */
+    // A client fired locally (client-side predicted) - broadcast it immediately
+    // to everyone else so their bullets appear in real time, not waiting on the
+    // slower host-sync tick. Kept intentionally tiny (no per-frame retransmit).
+    if (msg.type === 'shotFired') {
+      broadcastRoom(room, { type: 'shotFired', from: ws.playerId, bullets: msg.bullets }, ws);
+      return;
+    }
+
+    // A client's bullet hit something - forward to the host, who is the only
+    // one allowed to actually apply damage to the shared enemy list.
+    if (msg.type === 'hitReport') {
+      if (room.hostWs && room.hostWs !== ws) safeSend(room.hostWs, { type: 'hitReport', from: ws.playerId, hit: msg.hit });
+      return;
+    }
+
+    /* ---------------- HOST AUTHORITATIVE SNAPSHOT ---------------- */
+    // Only the host's browser runs real enemy AI/wave logic; it pushes a
+    // compact snapshot down to everyone else at a fixed tick rate.
+    if (msg.type === 'hostSync') {
+      if (ws !== room.hostWs) return; // ignore spoofed snapshots from non-hosts
+      if (typeof msg.wave === 'number') room.wave = msg.wave;
+      broadcastRoom(room, { type: 'hostSync', enemies: msg.enemies, wave: msg.wave, waveState: msg.waveState }, ws);
+      return;
+    }
+
+    /* ---------------- RESPAWN (team-up only: after the wave clears) ---------------- */
+    if (msg.type === 'respawnRequest') {
+      if (room.hostWs) safeSend(room.hostWs, { type: 'respawnRequest', from: ws.playerId });
+      return;
+    }
+    if (msg.type === 'respawnGranted') {
+      if (ws !== room.hostWs) return; // only host decides
+      const target = Array.from(room.players.entries()).find(([, p]) => p.id === msg.target);
+      if (target) { target[1].hp = msg.hp || 100; target[1].alive = true; safeSend(target[0], { type: 'respawnGranted' }); }
+      return;
+    }
+
+    /* ---------------- OWNER PANEL COMMANDS ---------------- */
     if (msg.type === 'ownerCommand' && ws.isOwner) {
-      // Owner panel commands get relayed to the room; the game client applies
-      // the effect locally (set speed / damage / kick / etc). Server just
-      // gatekeeps who is allowed to issue them.
-      const room = rooms.get(ws.roomId);
-      if (!room) return;
       const packet = JSON.stringify({ type: 'ownerCommand', command: msg.command, value: msg.value, target: msg.target });
       for (const client of room.players.keys()) {
         if (client.readyState === WebSocket.OPEN) client.send(packet);
@@ -261,13 +379,14 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    if (ws.roomId) {
-      const room = rooms.get(ws.roomId);
-      if (room) {
-        room.players.delete(ws);
-        if (room.players.size === 0) rooms.delete(ws.roomId);
-      }
-    }
+    if (!ws.roomId) return;
+    const room = rooms.get(ws.roomId);
+    if (!room) return;
+    room.players.delete(ws);
+    if (room.players.size === 0) { rooms.delete(ws.roomId); return; }
+    reassignHostIfNeeded(room);
+    broadcastLobby(room);
+    broadcastRoom(room, { type: 'playerLeft', id: ws.playerId });
   });
 });
 
@@ -280,7 +399,9 @@ setInterval(() => {
   });
 }, 15000);
 
-// Broadcast loop: send each room's player snapshot to everyone in it
+// Fast position/input broadcast loop - snapshot is small (id/x/y/hp/aim per
+// player) so a higher tick rate here is cheap and meaningfully reduces the
+// "rubber-banding" feel of the old 20Hz relay.
 setInterval(() => {
   for (const [roomId, room] of rooms) {
     if (room.players.size < 2) continue; // nobody to sync with yet, skip the work
@@ -290,6 +411,6 @@ setInterval(() => {
       if (client.readyState === WebSocket.OPEN) client.send(packet);
     }
   }
-}, TICK_MS);
+}, INPUT_TICK_MS);
 
-server.listen(PORT, () => console.log(`Orb Survivor server listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Orb Survivor server listening on ${PORT} (input tick ${INPUT_TICK_MS}ms, host-sync tick ${HOST_SYNC_TICK_MS}ms)`));
