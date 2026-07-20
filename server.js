@@ -109,6 +109,73 @@ async function getPlayFabUserData(playFabId) {
   return pfCall('/Server/GetUserData', { PlayFabId: playFabId });
 }
 
+async function getUserInventory(playFabId) {
+  return pfCall('/Server/GetUserInventory', { PlayFabId: playFabId });
+}
+
+// Catalog item IDs for the staff tags (see catalog.json) - kept in one place
+// so the tier check below stays readable.
+const STAFF_TAG_ITEMS = { owner: 'tag_owner', dev: 'tag_dev', moderator: 'tag_moderator' };
+
+// discordId -> { tier, expires }. Populated on Discord login, used to decide
+// who's allowed to send ownerCommand/moderation packets over the relay.
+// This is the server's own source of truth - it never trusts a client's
+// claimed tier, only what PlayFab actually says this player owns.
+const staffTierCache = new Map();
+const STAFF_TIER_TTL_MS = 10 * 60 * 1000; // 10 min - re-confirmed on every login
+
+async function resolveStaffTier(discordId, playFabId) {
+  if (ownerIds.has(discordId)) return 'owner'; // env-configured owner allowlist always wins
+  try {
+    const inv = await getUserInventory(playFabId);
+    const owned = new Set((inv?.Inventory || []).map(i => i.ItemId));
+    if (owned.has(STAFF_TAG_ITEMS.owner)) return 'owner';
+    if (owned.has(STAFF_TAG_ITEMS.dev)) return 'dev';
+    if (owned.has(STAFF_TAG_ITEMS.moderator)) return 'moderator';
+  } catch (e) {
+    console.warn('staff tier lookup failed', e.message);
+  }
+  return 'none';
+}
+
+async function authenticateSessionTicket(sessionTicket) {
+  return pfCall('/Server/AuthenticateSessionTicket', { SessionTicket: sessionTicket });
+}
+
+async function grantItemToUser(playFabId, itemId) {
+  return pfCall('/Server/GrantItemsToUser', {
+    PlayFabId: playFabId,
+    CatalogVersion: 'main',
+    ItemIds: [itemId]
+  });
+}
+
+/* =====================================================================
+   GRANT STORE PURCHASE (coin-bought weapons) INTO PLAYFAB INVENTORY
+   Called by the client right after a coin-store purchase so the unlock
+   is also reflected in PlayFab (persists across devices / matches the
+   Owned tab). The session ticket is verified server-side so a modified
+   client can't grant itself items it didn't actually buy locally -
+   this endpoint only proves "this is really you"; the coin-spend check
+   itself already happened client-side before this is called.
+===================================================================== */
+app.post('/grant-item', async (req, res) => {
+  const { sessionTicket, itemId } = req.body || {};
+  if (!sessionTicket || !itemId) return res.status(400).json({ ok: false, error: 'Missing sessionTicket or itemId' });
+
+  try {
+    const auth = await authenticateSessionTicket(sessionTicket);
+    const playFabId = auth?.UserInfo?.PlayFabId;
+    if (!playFabId) return res.status(401).json({ ok: false, error: 'Invalid session' });
+
+    await grantItemToUser(playFabId, itemId);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('grant-item failed', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 /* =====================================================================
    DISCORD OAUTH2 CALLBACK
 ===================================================================== */
@@ -148,6 +215,10 @@ app.get('/auth/discord/callback', async (req, res) => {
     const sessionTicket = pfLogin.SessionTicket;
 
     await setPlayFabDisplayName(playFabId, discordUsername).catch(e => console.warn('display name set failed', e.message));
+
+    const staffTier = await resolveStaffTier(discordId, playFabId);
+    staffTierCache.set(discordId, { tier: staffTier, expires: Date.now() + STAFF_TIER_TTL_MS });
+
     await setPlayFabUserData(playFabId, {
       discordId,
       discordUsername,
@@ -161,7 +232,8 @@ app.get('/auth/discord/callback', async (req, res) => {
       discordId,
       discordUsername,
       avatarUrl,
-      isOwner: ownerIds.has(discordId)
+      isOwner: ownerIds.has(discordId),
+      staffTier
     });
     res.send(`<!DOCTYPE html><html><body style="background:#05060a;color:#e9edf7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
       <p>Login complete — you can close this window.</p>
@@ -260,7 +332,9 @@ wss.on('connection', (ws) => {
       ws.roomId = msg.roomId || 'main';
       ws.playerId = msg.playerId || ('guest_' + Math.random().toString(36).slice(2, 8));
       ws.displayName = msg.displayName || 'Player';
-      ws.isOwner = ownerIds.has(ws.playerId); // never trust client-claimed isOwner
+      const cached = staffTierCache.get(ws.playerId);
+      ws.staffTier = (cached && cached.expires > Date.now()) ? cached.tier : (ownerIds.has(ws.playerId) ? 'owner' : 'none');
+      ws.isOwner = ws.staffTier === 'owner'; // never trust client-claimed isOwner - this comes from our own cache/allowlist
 
       const room = getRoom(ws.roomId);
       if (room.players.size >= MAX_ROOM_SIZE) {
@@ -279,6 +353,7 @@ wss.on('connection', (ws) => {
         type: 'joined',
         playerId: ws.playerId,
         isOwner: ws.isOwner,
+        staffTier: ws.staffTier,
         isHost: room.hostWs === ws,
         started: room.started
       }));
@@ -369,9 +444,9 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    /* ---------------- OWNER PANEL COMMANDS ---------------- */
-    if (msg.type === 'ownerCommand' && ws.isOwner) {
-      const packet = JSON.stringify({ type: 'ownerCommand', command: msg.command, value: msg.value, target: msg.target });
+    /* ---------------- STAFF COMMANDS (owner + dev + moderator) ---------------- */
+    if (msg.type === 'ownerCommand' && ws.staffTier && ws.staffTier !== 'none') {
+      const packet = JSON.stringify({ type: 'ownerCommand', command: msg.command, value: msg.value, target: msg.target, fromTier: ws.staffTier });
       for (const client of room.players.keys()) {
         if (client.readyState === WebSocket.OPEN) client.send(packet);
       }
