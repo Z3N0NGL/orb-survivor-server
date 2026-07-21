@@ -211,8 +211,20 @@ app.post('/grant-item', async (req, res) => {
    DISCORD OAUTH2 CALLBACK
 ===================================================================== */
 app.get('/auth/discord/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
+
+  // Validate `state` really is an origin string (scheme://host[:port], no
+  // path) before trusting it as a postMessage target - it's attacker
+  // controlled input (anyone can craft their own callback URL), so it must
+  // be structurally validated, never used raw.
+  let callerOrigin = null;
+  if (state) {
+    try {
+      const parsed = new URL(state);
+      if (parsed.origin === state) callerOrigin = state;
+    } catch (e) { /* not a valid URL -> ignore, fall back below */ }
+  }
 
   try {
     const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
@@ -276,11 +288,11 @@ app.get('/auth/discord/callback', async (req, res) => {
                                   // Discord display name containing "</script>" could break
                                   // out of the inline <script> block below and inject HTML/JS.
 
-    // Restrict postMessage to the game's real origin instead of '*', so the
-    // session ticket can't be handed to whatever origin the opener window
-    // happens to be showing (e.g. if it navigated away, or a malicious page
-    // somehow ended up holding a reference to this popup).
-    const targetOrigin = ALLOWED_ORIGIN === '*' ? '*' : JSON.stringify(ALLOWED_ORIGIN);
+    // Prefer the origin the login actually started from (via state); fall
+    // back to the configured ALLOWED_ORIGIN, then '*' as a last resort so a
+    // misconfigured/missing env var can't silently break login entirely.
+    const resolvedOrigin = callerOrigin || (ALLOWED_ORIGIN !== '*' ? ALLOWED_ORIGIN : null);
+    const targetOrigin = resolvedOrigin ? JSON.stringify(resolvedOrigin) : "'*'";
 
     res.send(`<!DOCTYPE html><html><body style="background:#05060a;color:#e9edf7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
       <p>Login complete — you can close this window.</p>
