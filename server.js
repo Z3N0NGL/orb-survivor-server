@@ -85,10 +85,27 @@ async function pfCall(path, body, useSecretKey = true) {
 }
 
 async function loginToPlayFabWithDiscordId(discordId) {
+  // Server-side login: used to resolve the canonical PlayFabId and to let us
+  // make authoritative /Server/* calls (grants, staff-tier lookups, etc).
+  // NOTE: the SessionTicket this returns is a *server* ticket - it is NOT
+  // valid for Client API calls like GetUserInventory, so it must never be
+  // sent to the browser. See loginToPlayFabAsClient below.
   return pfCall('/Server/LoginWithServerCustomId', {
     ServerCustomId: discordId,
     CreateAccount: true
   });
+}
+
+async function loginToPlayFabAsClient(discordId) {
+  // Client-side login: this is the ticket we actually hand to the browser.
+  // Using the same CustomId as the server login above resolves to the same
+  // PlayFabId, but this SessionTicket is valid for PlayFabClientSDK calls
+  // (GetUserInventory, etc), which is what the game's "Owned" tab uses.
+  return pfCall('/Client/LoginWithCustomID', {
+    TitleId: PLAYFAB_TITLE_ID,
+    CustomId: discordId,
+    CreateAccount: true
+  }, false); // false = no X-SecretKey header; this is a public client call
 }
 
 async function setPlayFabDisplayName(playFabId, displayName) {
@@ -150,6 +167,19 @@ async function grantItemToUser(playFabId, itemId) {
   });
 }
 
+// The ONLY items this public endpoint is allowed to grant: the coin-store
+// weapons (and the all-guns bundle). This mirrors GUN_ITEM_IDS on the
+// client - staff tags (tag_owner/tag_dev/tag_moderator) and any other
+// catalog item must NEVER be reachable here, since this endpoint only
+// proves "this is a real logged-in player", not "this player should have
+// this specific item". Without this allowlist, anyone could POST
+// { sessionTicket: <their own valid ticket>, itemId: 'tag_owner' } and
+// grant themselves staff access.
+const GRANTABLE_ITEM_IDS = new Set([
+  'gun_smg', 'gun_shotgun', 'gun_sniper', 'gun_rocket', 'gun_tesla',
+  'gun_flamethrower', 'gun_minigun', 'gun_burst', 'bundle_all_guns'
+]);
+
 /* =====================================================================
    GRANT STORE PURCHASE (coin-bought weapons) INTO PLAYFAB INVENTORY
    Called by the client right after a coin-store purchase so the unlock
@@ -162,6 +192,7 @@ async function grantItemToUser(playFabId, itemId) {
 app.post('/grant-item', async (req, res) => {
   const { sessionTicket, itemId } = req.body || {};
   if (!sessionTicket || !itemId) return res.status(400).json({ ok: false, error: 'Missing sessionTicket or itemId' });
+  if (!GRANTABLE_ITEM_IDS.has(itemId)) return res.status(403).json({ ok: false, error: 'This item cannot be granted through this endpoint.' });
 
   try {
     const auth = await authenticateSessionTicket(sessionTicket);
@@ -210,9 +241,16 @@ app.get('/auth/discord/callback', async (req, res) => {
       ? `https://cdn.discordapp.com/avatars/${discordId}/${profile.avatar}.png`
       : null;
 
+    // Server login resolves the canonical PlayFabId and lets us do
+    // authoritative /Server/* work (staff tier lookup, UpdateUserData, etc).
     const pfLogin = await loginToPlayFabWithDiscordId(discordId);
     const playFabId = pfLogin.PlayFabId;
-    const sessionTicket = pfLogin.SessionTicket;
+
+    // Client login gets us the SessionTicket we actually hand to the browser.
+    // Must be a genuine Client API ticket or PlayFabClientSDK calls (like the
+    // Owned tab's GetUserInventory) will silently fail to authenticate.
+    const pfClientLogin = await loginToPlayFabAsClient(discordId);
+    const sessionTicket = pfClientLogin.SessionTicket;
 
     await setPlayFabDisplayName(playFabId, discordUsername).catch(e => console.warn('display name set failed', e.message));
 
@@ -234,13 +272,22 @@ app.get('/auth/discord/callback', async (req, res) => {
       avatarUrl,
       isOwner: ownerIds.has(discordId),
       staffTier
-    });
+    }).replace(/</g, '\\u003c'); // JSON.stringify does NOT escape "<", so without this a
+                                  // Discord display name containing "</script>" could break
+                                  // out of the inline <script> block below and inject HTML/JS.
+
+    // Restrict postMessage to the game's real origin instead of '*', so the
+    // session ticket can't be handed to whatever origin the opener window
+    // happens to be showing (e.g. if it navigated away, or a malicious page
+    // somehow ended up holding a reference to this popup).
+    const targetOrigin = ALLOWED_ORIGIN === '*' ? '*' : JSON.stringify(ALLOWED_ORIGIN);
+
     res.send(`<!DOCTYPE html><html><body style="background:#05060a;color:#e9edf7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
       <p>Login complete — you can close this window.</p>
       <script>
         try {
           if (window.opener) {
-            window.opener.postMessage({ type: 'orbsurvivor_auth', payload: ${payload} }, '*');
+            window.opener.postMessage({ type: 'orbsurvivor_auth', payload: ${payload} }, ${targetOrigin});
           }
         } catch (e) {}
         setTimeout(() => window.close(), 800);
@@ -331,7 +378,9 @@ wss.on('connection', (ws) => {
     if (msg.type === 'join') {
       ws.roomId = msg.roomId || 'main';
       ws.playerId = msg.playerId || ('guest_' + Math.random().toString(36).slice(2, 8));
-      ws.displayName = msg.displayName || 'Player';
+      ws.displayName = (typeof msg.displayName === 'string' && msg.displayName.trim())
+        ? msg.displayName.trim().slice(0, 32)
+        : 'Player';
       const cached = staffTierCache.get(ws.playerId);
       ws.staffTier = (cached && cached.expires > Date.now()) ? cached.tier : (ownerIds.has(ws.playerId) ? 'owner' : 'none');
       ws.isOwner = ws.staffTier === 'owner'; // never trust client-claimed isOwner - this comes from our own cache/allowlist
