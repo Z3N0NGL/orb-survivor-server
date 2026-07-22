@@ -84,23 +84,28 @@ async function pfCall(path, body, useSecretKey = true) {
   return json.data;
 }
 
-async function loginToPlayFabWithDiscordId(discordId) {
-  // Server-side login: used to resolve the canonical PlayFabId and to let us
-  // make authoritative /Server/* calls (grants, staff-tier lookups, etc).
-  // NOTE: the SessionTicket this returns is a *server* ticket - it is NOT
-  // valid for Client API calls like GetUserInventory, so it must never be
-  // sent to the browser. See loginToPlayFabAsClient below.
-  return pfCall('/Server/LoginWithServerCustomId', {
-    ServerCustomId: discordId,
-    CreateAccount: true
-  });
-}
-
+// IMPORTANT: PlayFab treats "Server Custom ID" (/Server/LoginWithServerCustomId)
+// and "Client Custom ID" (/Client/LoginWithCustomID) as two SEPARATE, mutually
+// exclusive linked-identity namespaces - per PlayFab's own docs: "Server Custom
+// ID and Client Custom ID are mutually exclusive and cannot be used to retrieve
+// the same player account." Passing the same discordId to both does NOT give
+// you the same PlayFabId back.
+//
+// This codebase used to call both: a server login (for grants/staff-tier/user
+// data) and a client login (for the browser's SessionTicket). That silently
+// created TWO different PlayFab accounts per Discord user. Dashboard grants
+// (made by searching the PlayFabId shown in-game, which came from the SERVER
+// login) landed on account A, while the browser's live session - and therefore
+// GetUserInventory in the "Owned" tab - authenticated as account B. Result:
+// item shows granted in the PlayFab dashboard, never appears in-game.
+//
+// Fix: do ONLY the client login, and use that single resulting PlayFabId for
+// every server-side call too (grants, staff-tier lookup, display name, user
+// data). The SecretKey already authorizes /Server/* calls regardless of which
+// login produced the PlayFabId, so there's no need for a separate server login.
 async function loginToPlayFabAsClient(discordId) {
-  // Client-side login: this is the ticket we actually hand to the browser.
-  // Using the same CustomId as the server login above resolves to the same
-  // PlayFabId, but this SessionTicket is valid for PlayFabClientSDK calls
-  // (GetUserInventory, etc), which is what the game's "Owned" tab uses.
+  // Client-side login: this is both the ticket we hand to the browser AND the
+  // single source of truth for this player's PlayFabId used everywhere below.
   return pfCall('/Client/LoginWithCustomID', {
     TitleId: PLAYFAB_TITLE_ID,
     CustomId: discordId,
@@ -253,16 +258,13 @@ app.get('/auth/discord/callback', async (req, res) => {
       ? `https://cdn.discordapp.com/avatars/${discordId}/${profile.avatar}.png`
       : null;
 
-    // Server login resolves the canonical PlayFabId and lets us do
-    // authoritative /Server/* work (staff tier lookup, UpdateUserData, etc).
-    const pfLogin = await loginToPlayFabWithDiscordId(discordId);
-    const playFabId = pfLogin.PlayFabId;
-
-    // Client login gets us the SessionTicket we actually hand to the browser.
-    // Must be a genuine Client API ticket or PlayFabClientSDK calls (like the
-    // Owned tab's GetUserInventory) will silently fail to authenticate.
+    // Single login, used as the source of truth for BOTH the browser's
+    // SessionTicket and the PlayFabId every /Server/* call below acts on.
+    // (See the big comment above loginToPlayFabAsClient for why there must
+    // only be one login here.)
     const pfClientLogin = await loginToPlayFabAsClient(discordId);
     const sessionTicket = pfClientLogin.SessionTicket;
+    const playFabId = pfClientLogin.PlayFabId;
 
     await setPlayFabDisplayName(playFabId, discordUsername).catch(e => console.warn('display name set failed', e.message));
 
