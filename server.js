@@ -265,6 +265,7 @@ app.get('/auth/discord/callback', async (req, res) => {
     const pfClientLogin = await loginToPlayFabAsClient(discordId);
     const sessionTicket = pfClientLogin.SessionTicket;
     const playFabId = pfClientLogin.PlayFabId;
+    console.log(`[login] discordId=${discordId} (${discordUsername}) -> PlayFabId=${playFabId}  <-- grant items to THIS id in the dashboard`);
 
     await setPlayFabDisplayName(playFabId, discordUsername).catch(e => console.warn('display name set failed', e.message));
 
