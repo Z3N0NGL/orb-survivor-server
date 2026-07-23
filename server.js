@@ -114,10 +114,21 @@ async function loginToPlayFabAsClient(discordId) {
 }
 
 async function setPlayFabDisplayName(playFabId, displayName) {
-  return pfCall('/Admin/UpdateUserTitleDisplayName', {
-    PlayFabId: playFabId,
-    DisplayName: displayName
-  });
+  try {
+    return await pfCall('/Admin/UpdateUserTitleDisplayName', { PlayFabId: playFabId, DisplayName: displayName });
+  } catch (err) {
+    // PlayFab enforces unique display names per title. If an old/orphaned
+    // account (e.g. one created by the now-removed dual-login bug) already
+    // holds this exact name, every future attempt to set it on the correct
+    // account fails forever with "Name not available" - so fall back to a
+    // short, stable suffix instead of leaving the player nameless.
+    if (/name.*not available|already.*taken|duplicate/i.test(err.message || '')) {
+      const fallbackName = `${displayName}-${playFabId.slice(-4)}`.slice(0, 25);
+      console.warn(`display name "${displayName}" unavailable for ${playFabId} (likely squatted by an orphaned account) - using fallback "${fallbackName}"`);
+      return pfCall('/Admin/UpdateUserTitleDisplayName', { PlayFabId: playFabId, DisplayName: fallbackName });
+    }
+    throw err;
+  }
 }
 
 async function setPlayFabUserData(playFabId, data) {
@@ -146,6 +157,23 @@ const STAFF_TAG_ITEMS = { owner: 'tag_owner', dev: 'tag_dev', moderator: 'tag_mo
 const staffTierCache = new Map();
 const STAFF_TIER_TTL_MS = 10 * 60 * 1000; // 10 min - re-confirmed on every login
 
+// discordId -> PlayFabId this Discord user resolved to on their most recent
+// login. LoginWithCustomID is deterministic (same CustomId always resolves
+// to the same PlayFabId), so this should NEVER change for a given discordId.
+// If it ever does, that's exactly the symptom of the old dual-login bug (two
+// separate PlayFab accounts per player) recurring - log it loudly instead of
+// letting it fail silently and cost another round of "grant doesn't show up".
+// NOTE: this is in-memory only and resets on server restart - it's a canary,
+// not a source of truth.
+const knownPlayFabIdByDiscordId = new Map();
+function checkForDuplicateAccount(discordId, playFabId) {
+  const prev = knownPlayFabIdByDiscordId.get(discordId);
+  if (prev && prev !== playFabId) {
+    console.error(`[DUPLICATE ACCOUNT WARNING] discordId=${discordId} previously resolved to PlayFabId=${prev}, now resolves to PlayFabId=${playFabId}. These are two different PlayFab accounts for the same Discord user - grants made to one will never show up for the other. This should not happen with the current single-login code; if you see this, something upstream (PlayFab title config, a code change, etc) is creating a second account again.`);
+  }
+  knownPlayFabIdByDiscordId.set(discordId, playFabId);
+}
+
 async function resolveStaffTier(discordId, playFabId) {
   if (ownerIds.has(discordId)) return 'owner'; // env-configured owner allowlist always wins
   try {
@@ -162,6 +190,37 @@ async function resolveStaffTier(discordId, playFabId) {
 
 async function authenticateSessionTicket(sessionTicket) {
   return pfCall('/Server/AuthenticateSessionTicket', { SessionTicket: sessionTicket });
+}
+
+/* =====================================================================
+   BANS - enforced purely from PlayFab. The ONLY way to ban a player is
+   to add a ban for their PlayFabId in the PlayFab dashboard (Players ->
+   [player] -> Bans, or the Bans tab). There is no in-game ban button and
+   no server endpoint that creates a ban - this only ever READS ban state
+   from PlayFab and enforces it.
+===================================================================== */
+async function getUserBans(playFabId) {
+  return pfCall('/Server/GetUserBans', { PlayFabId: playFabId });
+}
+
+// discordId -> { banned, reason, expires (ban cache expiry, not the ban's own expiry) }
+const banStatusCache = new Map();
+const BAN_STATUS_TTL_MS = 5 * 60 * 1000; // re-checked every 5 min, and always fresh at login
+
+async function resolveBanStatus(playFabId) {
+  try {
+    const result = await getUserBans(playFabId);
+    const bans = result?.BanData || [];
+    const now = Date.now();
+    const activeBan = bans.find(b => b.Active && (!b.Expires || new Date(b.Expires).getTime() > now));
+    if (activeBan) {
+      return { banned: true, reason: activeBan.Reason || 'No reason given.', expires: activeBan.Expires || null };
+    }
+    return { banned: false };
+  } catch (e) {
+    console.warn('ban status lookup failed', e.message);
+    return { banned: false }; // fail open - a PlayFab hiccup should never itself lock everyone out
+  }
 }
 
 async function grantItemToUser(playFabId, itemId) {
@@ -204,10 +263,88 @@ app.post('/grant-item', async (req, res) => {
     const playFabId = auth?.UserInfo?.PlayFabId;
     if (!playFabId) return res.status(401).json({ ok: false, error: 'Invalid session' });
 
+    const banStatus = await resolveBanStatus(playFabId);
+    if (banStatus.banned) return res.status(403).json({ ok: false, error: 'This account is banned.' });
+
     await grantItemToUser(playFabId, itemId);
     res.json({ ok: true });
   } catch (err) {
     console.error('grant-item failed', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* =====================================================================
+   LEADERBOARDS (PlayFab Statistics)
+===================================================================== */
+async function getPlayerStatistics(playFabId, statisticNames) {
+  return pfCall('/Server/GetPlayerStatistics', { PlayFabId: playFabId, StatisticNames: statisticNames });
+}
+async function updatePlayerStatistics(playFabId, statistics) {
+  return pfCall('/Server/UpdatePlayerStatistics', { PlayFabId: playFabId, Statistics: statistics });
+}
+async function getLeaderboard(statisticName, maxResults) {
+  return pfCall('/Server/GetLeaderboard', {
+    StatisticName: statisticName,
+    StartPosition: 0,
+    MaxResultsCount: maxResults,
+    ProfileConstraints: { ShowDisplayName: true }
+  });
+}
+
+// These statistic names must exist in the PlayFab dashboard (created
+// automatically the first time they're written, or add them manually under
+// Title Overview -> Statistics) with aggregation set to "Max" so a worse
+// run never overwrites a better one. We also enforce that server-side below
+// so it's correct even if that dashboard setting is left on the default.
+const LEADERBOARD_STATS = { wave: 'HighestWave', kills: 'MostKillsInRun' };
+
+app.post('/submit-score', async (req, res) => {
+  const { sessionTicket, wave, kills } = req.body || {};
+  if (!sessionTicket || typeof wave !== 'number' || typeof kills !== 'number') {
+    return res.status(400).json({ ok: false, error: 'Missing sessionTicket, wave, or kills' });
+  }
+  try {
+    const auth = await authenticateSessionTicket(sessionTicket);
+    const playFabId = auth?.UserInfo?.PlayFabId;
+    if (!playFabId) return res.status(401).json({ ok: false, error: 'Invalid session' });
+
+    const banStatus = await resolveBanStatus(playFabId);
+    if (banStatus.banned) return res.status(403).json({ ok: false, error: 'This account is banned.' });
+
+    const current = await getPlayerStatistics(playFabId, [LEADERBOARD_STATS.wave, LEADERBOARD_STATS.kills]);
+    const currentByName = {};
+    for (const s of (current?.Statistics || [])) currentByName[s.StatisticName] = s.Value;
+
+    const toUpdate = [];
+    if (Math.floor(wave) > (currentByName[LEADERBOARD_STATS.wave] || 0)) {
+      toUpdate.push({ StatisticName: LEADERBOARD_STATS.wave, Value: Math.floor(wave) });
+    }
+    if (Math.floor(kills) > (currentByName[LEADERBOARD_STATS.kills] || 0)) {
+      toUpdate.push({ StatisticName: LEADERBOARD_STATS.kills, Value: Math.floor(kills) });
+    }
+    if (toUpdate.length) await updatePlayerStatistics(playFabId, toUpdate);
+
+    res.json({ ok: true, newBest: toUpdate.length > 0 });
+  } catch (err) {
+    console.error('submit-score failed', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/leaderboard', async (req, res) => {
+  const statKey = req.query.stat === 'kills' ? 'kills' : 'wave';
+  const count = Math.min(50, Math.max(1, parseInt(req.query.count, 10) || 10));
+  try {
+    const result = await getLeaderboard(LEADERBOARD_STATS[statKey], count);
+    const entries = (result?.Leaderboard || []).map(e => ({
+      position: e.Position + 1,
+      displayName: e.DisplayName || e.PlayFabId.slice(0, 8),
+      value: e.StatValue
+    }));
+    res.json({ ok: true, stat: statKey, entries });
+  } catch (err) {
+    console.error('leaderboard fetch failed', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -266,6 +403,27 @@ app.get('/auth/discord/callback', async (req, res) => {
     const sessionTicket = pfClientLogin.SessionTicket;
     const playFabId = pfClientLogin.PlayFabId;
     console.log(`[login] discordId=${discordId} (${discordUsername}) -> PlayFabId=${playFabId}  <-- grant items to THIS id in the dashboard`);
+    checkForDuplicateAccount(discordId, playFabId);
+
+    const banStatus = await resolveBanStatus(playFabId);
+    banStatusCache.set(discordId, { ...banStatus, expires: Date.now() + BAN_STATUS_TTL_MS });
+    if (banStatus.banned) {
+      console.log(`[login] BLOCKED (banned): discordId=${discordId} PlayFabId=${playFabId} reason="${banStatus.reason}"`);
+      const banPayload = JSON.stringify({ reason: banStatus.reason, expires: banStatus.expires }).replace(/</g, '\\u003c');
+      const resolvedOrigin = callerOrigin || (ALLOWED_ORIGIN !== '*' ? ALLOWED_ORIGIN : null);
+      const targetOrigin = resolvedOrigin ? JSON.stringify(resolvedOrigin) : "'*'";
+      return res.send(`<!DOCTYPE html><html><body style="background:#05060a;color:#e9edf7;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+        <p>You are banned — you can close this window.</p>
+        <script>
+          try {
+            if (window.opener) {
+              window.opener.postMessage({ type: 'orbsurvivor_auth_banned', payload: ${banPayload} }, ${targetOrigin});
+            }
+          } catch (e) {}
+          setTimeout(() => window.close(), 1200);
+        </script>
+      </body></html>`);
+    }
 
     await setPlayFabDisplayName(playFabId, discordUsername).catch(e => console.warn('display name set failed', e.message));
 
@@ -399,6 +557,13 @@ wss.on('connection', (ws) => {
       const cached = staffTierCache.get(ws.playerId);
       ws.staffTier = (cached && cached.expires > Date.now()) ? cached.tier : (ownerIds.has(ws.playerId) ? 'owner' : 'none');
       ws.isOwner = ws.staffTier === 'owner'; // never trust client-claimed isOwner - this comes from our own cache/allowlist
+
+      const banCached = banStatusCache.get(ws.playerId);
+      if (banCached && banCached.expires > Date.now() && banCached.banned) {
+        safeSend(ws, { type: 'joinRejected', reason: 'This account is banned.' });
+        ws.close();
+        return;
+      }
 
       const room = getRoom(ws.roomId);
       if (room.players.size >= MAX_ROOM_SIZE) {
